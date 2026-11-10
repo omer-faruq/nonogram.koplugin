@@ -1,4 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local ButtonTable = require("ui/widget/buttontable")
 local DataStorage = require("datastorage")
 local Device = require("device")
@@ -19,6 +20,8 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local _ = require("gettext")
 local T = require("ffi/util").template
+local Logic = require("nonogram_logic")
+local Puzzles = require("nonogram_puzzles")
 
 local Screen = Device.screen
 
@@ -135,10 +138,13 @@ local function clonePuzzleForState(puzzle)
         max_col_hint = puzzle.max_col_hint,
         solution = copySolutionGrid(puzzle.solution),
         is_random = puzzle.is_random,
+        unique = puzzle.unique,
+        picture_id = puzzle.picture_id,
+        name = puzzle.name,
     }
 end
 
-local function buildPuzzleFromBooleanGrid(grid, title)
+local function buildPuzzleFromBooleanGrid(grid, title, unique)
     local rows = #grid
     local cols = rows > 0 and #grid[1] or 0
     local lines = {}
@@ -152,6 +158,7 @@ local function buildPuzzleFromBooleanGrid(grid, title)
     local puzzle = buildHintsFromLines(lines)
     puzzle.title = title
     puzzle.is_random = true
+    puzzle.unique = unique or nil
     return puzzle
 end
 
@@ -234,7 +241,15 @@ function NonogramBoard:getPuzzle()
 end
 
 function NonogramBoard:getPuzzleTitle()
-    return (self.current and self.current.title) or _("Puzzle")
+    local puzzle = self.current
+    if not puzzle then
+        return _("Puzzle")
+    end
+    -- A picture's name stays hidden until the player has seen the picture.
+    if puzzle.name and (self.show_solution or self:isSolved()) then
+        return _(puzzle.name)
+    end
+    return puzzle.title or _("Puzzle")
 end
 
 function NonogramBoard:getRowCount()
@@ -326,36 +341,18 @@ function NonogramBoard:isRowSatisfied(row)
     if not self.current then
         return false
     end
-    for col = 1, self:getColCount() do
-        local solution = self.current.solution[row][col]
-        local state = self.user_grid[row][col]
-        if solution then
-            if state ~= 1 then
-                return false
-            end
-        elseif state == 1 then
-            return false
-        end
-    end
-    return true
+    return Logic.lineMatches(self.current.row_hints[row], self:getColCount(), function(col)
+        return self.user_grid[row][col] == 1
+    end)
 end
 
 function NonogramBoard:isColSatisfied(col)
     if not self.current then
         return false
     end
-    for row = 1, self:getRowCount() do
-        local solution = self.current.solution[row][col]
-        local state = self.user_grid[row][col]
-        if solution then
-            if state ~= 1 then
-                return false
-            end
-        elseif state == 1 then
-            return false
-        end
-    end
-    return true
+    return Logic.lineMatches(self.current.col_hints[col], self:getRowCount(), function(row)
+        return self.user_grid[row][col] == 1
+    end)
 end
 
 function NonogramBoard:applyAction(action)
@@ -384,6 +381,9 @@ function NonogramBoard:applyAction(action)
     self.conflict_visible = false
     self.incorrect_filled = {}
     self.highlight_hints = false
+    if self:isSolved() then
+        self:reconcileSolution()
+    end
     return true
 end
 
@@ -394,6 +394,7 @@ function NonogramBoard:revealHint()
     if self.show_solution then
         return false, _("Already showing the solution.")
     end
+    self:reconcileSolution()
     local rows = self:getRowCount()
     local cols = self:getColCount()
     for r = 1, rows do
@@ -428,24 +429,25 @@ function NonogramBoard:hasConflicts()
     return false
 end
 
+-- Solved means the filled cells satisfy every clue, whichever picture that is.
 function NonogramBoard:isSolved()
     if not self.current then
         return false
     end
-    for r = 1, self:getRowCount() do
-        for c = 1, self:getColCount() do
-            local solution = self.current.solution[r][c]
-            local state = self.user_grid[r][c]
-            if solution then
-                if state ~= 1 then
-                    return false
-                end
-            elseif state == 1 then
-                return false
-            end
-        end
+    return Logic.matchesHints(self.user_grid, self.current.row_hints, self.current.col_hints)
+end
+
+-- Puzzles saved by older versions can have several valid solutions. If the
+-- player's marks disagree with the stored one but fit another, adopt that one
+-- so Check, Hint and Show solution judge against a picture they can reach.
+function NonogramBoard:reconcileSolution()
+    if not self.current or self.current.unique or not self:hasConflicts() then
+        return
     end
-    return true
+    local solution = Logic.findSolution(self.current.row_hints, self.current.col_hints, self.user_grid)
+    if solution then
+        self.current.solution = solution
+    end
 end
 
 function NonogramBoard:copyGrid(grid)
@@ -528,14 +530,21 @@ function NonogramBoard:generateRandomPuzzle(rows, cols, density)
     rows = clamp(math.floor(rows or math.random(10, 15)), 5, 20)
     cols = clamp(math.floor(cols or math.random(10, 15)), 5, 20)
     density = math.max(0.2, math.min(0.8, density or (0.35 + math.random() * 0.3)))
-    local grid = {}
-    for r = 1, rows do
-        grid[r] = {}
-        for c = 1, cols do
-            grid[r][c] = math.random() < density
-        end
-    end
-    local puzzle = buildPuzzleFromBooleanGrid(grid, T(_("Random %1x%2"), rows, cols))
+    -- Only pictures solvable by logic alone are used, so the clues have
+    -- exactly one solution.
+    local grid, unique = Logic.generate(rows, cols, density)
+    local puzzle = buildPuzzleFromBooleanGrid(grid, T(_("Random %1x%2"), rows, cols), unique)
+    self:setCurrentPuzzle(puzzle)
+    return self.current
+end
+
+-- Loads a hand-drawn picture (an entry of nonogram_puzzles.lua).
+function NonogramBoard:loadPicture(entry, title)
+    local puzzle = buildHintsFromLines(entry.rows)
+    puzzle.title = title
+    puzzle.name = entry.name
+    puzzle.picture_id = entry.id
+    puzzle.unique = true
     self:setCurrentPuzzle(puzzle)
     return self.current
 end
@@ -544,6 +553,7 @@ function NonogramBoard:checkProgress()
     if not self.current then
         return { solved = false, conflicts = false }
     end
+    self:reconcileSolution()
     local solved = self:isSolved()
     local conflicts = false
     local incorrect = {}
@@ -850,6 +860,7 @@ function NonogramScreen:init()
     self.status_text = TextWidget:new{
         text = _("Tap a cell, then use the buttons below to fill or mark it."),
         face = Font:getFace("smallinfofont"),
+        max_width = math.floor(Screen:getWidth() * 0.95),
     }
     self.board_widget = NonogramBoardWidget:new{
         board = self.board,
@@ -1053,10 +1064,16 @@ function NonogramScreen:onAction(action)
         return
     end
     self.board_widget:refresh()
-    self.plugin:saveState()
     if self.board:isSolved() then
-        UIManager:show(InfoMessage:new{ text = _("Great job!"), timeout = 3 })
+        local puzzle = self.board:getPuzzle()
+        local text = _("Great job!")
+        if puzzle.name then
+            text = text .. "\n" .. _(puzzle.name)
+        end
+        self.plugin:markPictureSolved(puzzle)
+        UIManager:show(InfoMessage:new{ text = text, timeout = 3 })
     end
+    self.plugin:saveState()
     self:updateStatus()
 end
 
@@ -1159,8 +1176,37 @@ function NonogramScreen:onClose()
     self.plugin:onScreenClosed()
 end
 
+-- Asks which kind of puzzle to start: the next picture or a random one.
 function NonogramScreen:onNewGame()
-    self.board:generateRandomPuzzle()
+    local dialog
+    local function choice(text, start)
+        return { {
+            text = text,
+            callback = function()
+                UIManager:close(dialog)
+                self:onPuzzleChanged(start())
+            end,
+        } }
+    end
+    dialog = ButtonDialog:new{
+        title = _("New game"),
+        title_align = "center",
+        buttons = {
+            choice(T(_("Picture puzzle (%1/%2 solved)"),
+                Puzzles.solvedCount(self.plugin:getSolvedPictures()), Puzzles.count()), function()
+                self.plugin:startNextPicture()
+                return self.board:getPuzzleTitle()
+            end),
+            choice(_("Random puzzle"), function()
+                self.board:generateRandomPuzzle()
+                return _("Generated a new random puzzle.")
+            end),
+        },
+    }
+    UIManager:show(dialog)
+end
+
+function NonogramScreen:onPuzzleChanged(message)
     if self.board_widget.updateMetrics then
         self.board_widget:updateMetrics()
     end
@@ -1169,7 +1215,7 @@ function NonogramScreen:onNewGame()
     self:updateSolutionButton()
     self.active_action = nil
     self:setActiveAction("fill")
-    self:updateStatus(_("Generated a new random puzzle."))
+    self:updateStatus(message)
 end
 
 --
@@ -1202,12 +1248,33 @@ function Nonogram:getBoard()
         self.board = NonogramBoard:new()
         local state = self.settings:readSetting("state")
         if not self.board:load(state) then
-            self.board:generateRandomPuzzle()
+            self:startNextPicture()
         else
             self.board:ensurePuzzle()
         end
     end
     return self.board
+end
+
+-- Ids of the pictures the player has completed: { [id] = true }.
+function Nonogram:getSolvedPictures()
+    return self.settings:readSetting("solved_pictures") or {}
+end
+
+function Nonogram:markPictureSolved(puzzle)
+    if not (puzzle and puzzle.picture_id) then
+        return
+    end
+    local solved = self:getSolvedPictures()
+    solved[puzzle.picture_id] = true
+    self.settings:saveSetting("solved_pictures", solved)
+end
+
+-- Loads the next unsolved picture after the current one (in list order).
+function Nonogram:startNextPicture()
+    local current = self.board:getPuzzle()
+    local entry, index = Puzzles.next(self:getSolvedPictures(), current and current.picture_id)
+    self.board:loadPicture(entry, T(_("Picture %1/%2"), index, Puzzles.count()))
 end
 
 function Nonogram:saveState()
